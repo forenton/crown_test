@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -18,6 +19,9 @@ from services.settings import (
     get_ollama_temperature,
     get_ollama_timeout_seconds,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 MODEL_ITEM_JSON_SCHEMA = {
@@ -99,6 +103,18 @@ class OllamaError(Exception):
         super().__init__(detail)
 
 
+class OllamaRetryableError(OllamaError):
+    pass
+
+
+class OllamaResponseFormatError(OllamaRetryableError):
+    pass
+
+
+class OllamaTransientHTTPError(OllamaRetryableError):
+    pass
+
+
 async def summarize_contract_fragments(
     fragments_by_category: dict[str, list[PdfTextFragment]],
     model: str | None = None,
@@ -107,13 +123,34 @@ async def summarize_contract_fragments(
 
     for config in CATEGORY_CONFIGS:
         fragments = fragments_by_category.get(config.name, [])
-        result = await analyze_category(
-            config=config,
-            fragments=fragments,
-            model=model,
-        )
+        last_error: OllamaRetryableError | None = None
 
-        _merge_category_result(summary, config, result, fragments)
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            try:
+                result = await analyze_category(
+                    config=config,
+                    fragments=fragments,
+                    model=model,
+                )
+                _merge_category_result(summary, config, result, fragments)
+                break
+            except OllamaRetryableError as exc:
+                last_error = exc
+                if attempt < max_attempts:
+                    logger.warning(
+                        "Retrying Ollama category analysis after retryable error "
+                        "for %s, attempt %s/%s: %s",
+                        config.name,
+                        attempt + 1,
+                        max_attempts,
+                        exc.detail,
+                    )
+        else:
+            raise OllamaError(
+                f"Ollama returned invalid response for {config.name} after 2 attempts: "
+                f"{last_error.detail if last_error else 'unknown retryable error'}"
+            ) from last_error
 
     return summary
 
@@ -185,8 +222,13 @@ async def _request_category_summary(
             504,
         ) from exc
     except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code
+        if status_code in {500, 502, 503}:
+            raise OllamaTransientHTTPError(
+                f"Ollama returned temporary HTTP {status_code} while analyzing {config.name}"
+            ) from exc
         raise OllamaError(
-            f"Ollama returned HTTP {exc.response.status_code} while analyzing {config.name}"
+            f"Ollama returned HTTP {status_code} while analyzing {config.name}"
         ) from exc
     except httpx.HTTPError as exc:
         raise OllamaError(f"Ollama request failed while analyzing {config.name}") from exc
@@ -194,7 +236,9 @@ async def _request_category_summary(
     try:
         content = response.json()["message"]["content"]
     except (KeyError, TypeError, ValueError) as exc:
-        raise OllamaError(f"Ollama returned an unexpected response for {config.name}") from exc
+        raise OllamaResponseFormatError(
+            f"Ollama returned an unexpected response for {config.name}"
+        ) from exc
 
     return _parse_category_summary(content, config)
 
@@ -285,16 +329,19 @@ def _format_fragments(category: str, fragments: list[PdfTextFragment]) -> str:
 
 
 def _parse_category_summary(content: str, config: CategoryConfig) -> dict[str, Any]:
-    data = _json_loads_lenient(content)
+    if not content.strip():
+        raise OllamaResponseFormatError(f"Ollama returned empty response for {config.name}")
+
+    data = _json_loads_lenient(content, config.name)
     if config.response_field not in data:
-        raise OllamaError(
+        raise OllamaResponseFormatError(
             f"Ollama JSON response for {config.name} must contain {config.response_field}"
         )
 
     try:
         ContractSummary.model_validate(_summary_data_from_category(config, data))
     except ValidationError as exc:
-        raise OllamaError(
+        raise OllamaResponseFormatError(
             f"Ollama returned invalid schema for {config.name}: {exc}"
         ) from exc
     return data
@@ -401,34 +448,43 @@ def _model_item_to_summary_item(
             }
         )
 
-    if require_known_sources and not sources and fragment_ids:
+    if require_known_sources and not sources:
         category_detail = f" for {category}" if category else ""
-        raise OllamaError(
+        detail = (
+            f": {', '.join(unknown_fragment_ids)}"
+            if unknown_fragment_ids
+            else ": no fragment_ids"
+        )
+        raise OllamaResponseFormatError(
             "Ollama returned unknown fragment_ids"
-            f"{category_detail}: {', '.join(unknown_fragment_ids)}"
+            f"{category_detail}{detail}"
         )
 
     return SummaryItem.model_validate({"value": value, "sources": sources})
 
 
-def _json_loads_lenient(content: str) -> dict[str, Any]:
+def _json_loads_lenient(content: str, category: str) -> dict[str, Any]:
     try:
-        return _ensure_json_object(json.loads(content))
+        return _ensure_json_object(json.loads(content), category)
     except json.JSONDecodeError as original_exc:
         match = re.search(r"\{.*\}", content, flags=re.DOTALL)
         if not match:
-            raise OllamaError("Ollama did not return JSON") from original_exc
+            raise OllamaResponseFormatError(
+                f"Ollama did not return JSON for {category}"
+            ) from original_exc
         try:
-            return _ensure_json_object(json.loads(match.group(0)))
+            return _ensure_json_object(json.loads(match.group(0)), category)
         except json.JSONDecodeError as extracted_exc:
-            raise OllamaError(
-                "Ollama returned malformed JSON. Increase OLLAMA_NUM_PREDICT "
+            raise OllamaResponseFormatError(
+                f"Ollama returned malformed JSON for {category}. Increase OLLAMA_NUM_PREDICT "
                 "or reduce OLLAMA_MAX_FRAGMENTS_PER_CATEGORY / OLLAMA_MAX_FRAGMENT_CHARS."
             ) from extracted_exc
 
 
-def _ensure_json_object(loaded: Any) -> dict[str, Any]:
+def _ensure_json_object(loaded: Any, category: str) -> dict[str, Any]:
     if not isinstance(loaded, dict):
-        raise OllamaError("Ollama JSON response must be an object")
+        raise OllamaResponseFormatError(
+            f"Ollama JSON response for {category} must be an object"
+        )
 
     return loaded
