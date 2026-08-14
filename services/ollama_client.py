@@ -19,6 +19,68 @@ from services.settings import (
 )
 
 
+SUMMARY_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "contract_amount": {
+            "anyOf": [
+                {"type": "null"},
+                {"$ref": "#/$defs/summary_item"},
+            ],
+        },
+        "performance_terms": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/summary_item"},
+        },
+        "contractor_requirements": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/summary_item"},
+        },
+        "penalties": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/summary_item"},
+        },
+    },
+    "required": [
+        "contract_amount",
+        "performance_terms",
+        "contractor_requirements",
+        "penalties",
+    ],
+    "additionalProperties": False,
+    "$defs": {
+        "summary_item": {
+            "type": "object",
+            "properties": {
+                "value": {"type": "string"},
+                "sources": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "clause": {
+                                "anyOf": [
+                                    {"type": "null"},
+                                    {"type": "string"},
+                                ],
+                            },
+                            "pages": {
+                                "type": "array",
+                                "items": {"type": "integer"},
+                            },
+                        },
+                        "required": ["clause", "pages"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["value", "sources"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
 class OllamaError(Exception):
     def __init__(self, detail: str, status_code: int = 502) -> None:
         self.detail = detail
@@ -47,7 +109,7 @@ async def _request_contract_summary(prompt: str, model: str | None = None) -> Co
     payload = {
         "model": selected_model,
         "stream": False,
-        "format": "json",
+        "format": SUMMARY_JSON_SCHEMA,
         "messages": [
             {
                 "role": "system",
@@ -103,14 +165,25 @@ def _build_summary_prompt(fragments_by_category: dict[str, list[PdfTextFragment]
         "- performance_terms: сроки выполнения, поставки, оказания услуг, этапы, даты начала/окончания;\n"
         "- contractor_requirements: ключевые требования и обязанности исполнителя/поставщика/подрядчика;\n"
         "- penalties: штрафы, пени, неустойки и условия ответственности.\n"
+        "Для каждого найденного значения обязательно укажи источники sources: номер пункта clause и страницы pages. "
+        "Бери clause и pages только из заголовка фрагмента. Если clause в заголовке null, верни null.\n"
         "Если поле не найдено в переданных фрагментах, верни null для суммы или пустой список. "
         "Не используй типовые формулировки, которых нет во фрагментах.\n"
         "Верни JSON строго такой структуры:\n"
         "{\n"
-        '  "contract_amount": "сумма контракта строкой или null",\n'
-        '  "performance_terms": ["сроки выполнения, поставки, этапы"],\n'
-        '  "contractor_requirements": ["ключевые требования к исполнителю"],\n'
-        '  "penalties": ["штрафы, пени, ответственность"]\n'
+        '  "contract_amount": {\n'
+        '    "value": "сумма контракта строкой",\n'
+        '    "sources": [{"clause": "номер пункта или null", "pages": [1]}]\n'
+        "  },\n"
+        '  "performance_terms": [\n'
+        '    {"value": "срок выполнения", "sources": [{"clause": "1.4", "pages": [1]}]}\n'
+        "  ],\n"
+        '  "contractor_requirements": [\n'
+        '    {"value": "требование", "sources": [{"clause": "2.1.1", "pages": [1]}]}\n'
+        "  ],\n"
+        '  "penalties": [\n'
+        '    {"value": "штраф или пеня", "sources": [{"clause": "10.2", "pages": [10]}]}\n'
+        "  ]\n"
         "}\n\n"
         f"Фрагменты договора:\n{_format_fragments_by_category(fragments_by_category)}"
     )
@@ -130,7 +203,8 @@ def _format_fragments_by_category(
         for fragment in fragments:
             pages = ", ".join(str(page) for page in fragment.page_numbers)
             sections.append(
-                f"[fragment={fragment.fragment_id}; pages={pages}; score={fragment.score}]\n"
+                f"[fragment={fragment.fragment_id}; clause={fragment.clause or 'null'}; "
+                f"pages=[{pages}]; score={fragment.score}]\n"
                 f"{fragment.text}"
             )
 
@@ -147,13 +221,21 @@ def _parse_contract_summary(content: str) -> ContractSummary:
 
 def _json_loads_lenient(content: str) -> dict[str, Any]:
     try:
-        loaded = json.loads(content)
-    except json.JSONDecodeError:
+        return _ensure_json_object(json.loads(content))
+    except json.JSONDecodeError as original_exc:
         match = re.search(r"\{.*\}", content, flags=re.DOTALL)
         if not match:
-            raise OllamaError("Ollama did not return JSON")
-        loaded = json.loads(match.group(0))
+            raise OllamaError("Ollama did not return JSON") from original_exc
+        try:
+            return _ensure_json_object(json.loads(match.group(0)))
+        except json.JSONDecodeError as extracted_exc:
+            raise OllamaError(
+                "Ollama returned malformed JSON. Increase OLLAMA_NUM_PREDICT "
+                "or reduce OLLAMA_MAX_FRAGMENTS_PER_CATEGORY / OLLAMA_MAX_FRAGMENT_CHARS."
+            ) from extracted_exc
 
+
+def _ensure_json_object(loaded: Any) -> dict[str, Any]:
     if not isinstance(loaded, dict):
         raise OllamaError("Ollama JSON response must be an object")
 

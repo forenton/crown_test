@@ -50,7 +50,7 @@ def validate_pdf_file(
         "valid": True,
         "filename": filename,
         "content_type": content_type,
-        "size_bytes": len(content),
+        "size_kb": round(len(content) / 1024, 2),
         "page_count": page_count,
         "encrypted": bool(reader.is_encrypted),
     }

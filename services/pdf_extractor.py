@@ -87,6 +87,7 @@ class PdfPageText:
 @dataclass(frozen=True)
 class PdfTextFragment:
     fragment_id: str
+    clause: str | None
     page_numbers: tuple[int, ...]
     text: str
     score: int
@@ -160,12 +161,24 @@ def split_pages_into_clauses(pages: list[PdfPageText]) -> list[PdfTextFragment]:
     current_lines: list[str] = []
     current_pages: set[int] = set()
     current_number: str | None = None
+    current_section: str | None = None
 
     for page in pages:
         for line in page.text.splitlines():
+            if is_section_header(line) and current_lines:
+                fragments.append(
+                    _make_fragment(current_number, current_section, current_pages, current_lines)
+                )
+                current_lines = []
+                current_pages = set()
+                current_number = None
+
+            current_section = update_section_context(line, current_section)
             clause_match = CLAUSE_NUMBER_RE.match(line)
             if clause_match and current_lines:
-                fragments.append(_make_fragment(current_number, current_pages, current_lines))
+                fragments.append(
+                    _make_fragment(current_number, current_section, current_pages, current_lines)
+                )
                 current_lines = []
                 current_pages = set()
 
@@ -176,7 +189,7 @@ def split_pages_into_clauses(pages: list[PdfPageText]) -> list[PdfTextFragment]:
             current_pages.add(page.page_number)
 
     if current_lines:
-        fragments.append(_make_fragment(current_number, current_pages, current_lines))
+        fragments.append(_make_fragment(current_number, current_section, current_pages, current_lines))
 
     return [fragment for fragment in fragments if len(fragment.text) >= 20]
 
@@ -226,6 +239,7 @@ def split_oversized_fragments(
             result.append(
                 PdfTextFragment(
                     fragment_id=f"{fragment.fragment_id}-part-{part_number}",
+                    clause=fragment.clause,
                     page_numbers=fragment.page_numbers,
                     text=chunk.strip(),
                     score=document_relevance_score(chunk),
@@ -255,6 +269,7 @@ def normalize_pdf_text(text: str) -> str:
 
 def _make_fragment(
     clause_number: str | None,
+    section_context: str | None,
     page_numbers: set[int],
     lines: list[str],
 ) -> PdfTextFragment:
@@ -263,6 +278,7 @@ def _make_fragment(
     text = "\n".join(lines).strip()
     return PdfTextFragment(
         fragment_id=fragment_id,
+        clause=format_clause_label(clause_number, section_context),
         page_numbers=ordered_pages,
         text=text,
         score=document_relevance_score(text),
@@ -272,6 +288,7 @@ def _make_fragment(
 def _make_window_fragment(page_numbers: list[int], text: str) -> PdfTextFragment:
     return PdfTextFragment(
         fragment_id=f"pages-{page_numbers[0]}-{page_numbers[-1]}",
+        clause=None,
         page_numbers=tuple(page_numbers),
         text=text.strip(),
         score=document_relevance_score(text),
@@ -281,10 +298,49 @@ def _make_window_fragment(page_numbers: list[int], text: str) -> PdfTextFragment
 def _with_score(fragment: PdfTextFragment, score: int) -> PdfTextFragment:
     return PdfTextFragment(
         fragment_id=fragment.fragment_id,
+        clause=fragment.clause,
         page_numbers=fragment.page_numbers,
         text=fragment.text,
         score=score,
     )
+
+
+def update_section_context(line: str, current_section: str | None) -> str | None:
+    normalized = line.strip().lower()
+    if not normalized:
+        return current_section
+
+    appendix_match = re.match(r"приложение\s*№\s*(\d+)", normalized)
+    if appendix_match:
+        return f"Приложение № {appendix_match.group(1)}"
+
+    if "техническое задание" in normalized:
+        appendix = current_section if current_section and current_section.startswith("Приложение") else None
+        return f"{appendix} / Техническое задание" if appendix else "Техническое задание"
+
+    if "локальный сметный расчет" in normalized or "смета" in normalized:
+        appendix = current_section if current_section and current_section.startswith("Приложение") else None
+        return f"{appendix} / Локальный сметный расчет" if appendix else "Локальный сметный расчет"
+
+    return current_section
+
+
+def is_section_header(line: str) -> bool:
+    normalized = line.strip().lower()
+    return (
+        bool(re.match(r"приложение\s*№\s*\d+", normalized))
+        or "техническое задание" in normalized
+        or normalized.startswith("локальный сметный расчет")
+        or normalized.startswith("смета")
+    )
+
+
+def format_clause_label(clause_number: str | None, section_context: str | None) -> str | None:
+    if not clause_number:
+        return section_context
+    if section_context:
+        return f"{section_context}, пункт {clause_number}"
+    return clause_number
 
 
 def document_relevance_score(text: str) -> int:

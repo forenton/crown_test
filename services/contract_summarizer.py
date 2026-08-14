@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from schemas import ContractSummary
+from schemas import ContractSummary, SummaryItem, SummarySource
 from services.ollama_client import summarize_contract_fragments
 from services.pdf_extractor import PdfTextFragment
 
@@ -17,19 +17,42 @@ async def summarize_contract_fragments_by_category(
     )
 
 
-def _deduplicate_items(items: object) -> list[str]:
-    unique_items = []
-    seen = set()
+def _deduplicate_items(items: object) -> list[SummaryItem]:
+    items_by_value: dict[str, SummaryItem] = {}
 
     for item in items:
-        normalized = _normalize_for_deduplication(str(item))
-        if not normalized or normalized in seen:
+        if not isinstance(item, SummaryItem):
+            item = SummaryItem.model_validate(item)
+
+        normalized = _normalize_for_deduplication(item.value)
+        if not normalized:
             continue
 
-        seen.add(normalized)
-        unique_items.append(str(item).strip())
+        if normalized not in items_by_value:
+            items_by_value[normalized] = SummaryItem(
+                value=item.value.strip(),
+                sources=_deduplicate_sources(item.sources),
+            )
+            continue
 
-    return unique_items
+        existing = items_by_value[normalized]
+        existing.sources = _deduplicate_sources([*existing.sources, *item.sources])
+
+    return list(items_by_value.values())
+
+
+def _deduplicate_sources(sources: list[SummarySource]) -> list[SummarySource]:
+    unique_sources = []
+    seen = set()
+
+    for source in sources:
+        key = (source.clause, tuple(source.pages))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_sources.append(source)
+
+    return unique_sources
 
 
 def _normalize_for_deduplication(value: str) -> str:
