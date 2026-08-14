@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
 from pydantic import ValidationError
 
-from schemas import ContractSummary
+from schemas import ContractSummary, SummaryItem
 from services.pdf_extractor import PdfTextFragment
 from services.settings import (
     SettingsError,
@@ -19,66 +20,76 @@ from services.settings import (
 )
 
 
-SUMMARY_JSON_SCHEMA = {
+MODEL_ITEM_JSON_SCHEMA = {
     "type": "object",
     "properties": {
-        "contract_amount": {
-            "anyOf": [
-                {"type": "null"},
-                {"$ref": "#/$defs/summary_item"},
-            ],
-        },
-        "performance_terms": {
+        "value": {"type": "string"},
+        "fragment_ids": {
             "type": "array",
-            "items": {"$ref": "#/$defs/summary_item"},
-        },
-        "contractor_requirements": {
-            "type": "array",
-            "items": {"$ref": "#/$defs/summary_item"},
-        },
-        "penalties": {
-            "type": "array",
-            "items": {"$ref": "#/$defs/summary_item"},
+            "items": {"type": "string"},
+            "minItems": 1,
         },
     },
-    "required": [
-        "contract_amount",
-        "performance_terms",
-        "contractor_requirements",
-        "penalties",
-    ],
+    "required": ["value", "fragment_ids"],
     "additionalProperties": False,
-    "$defs": {
-        "summary_item": {
-            "type": "object",
-            "properties": {
-                "value": {"type": "string"},
-                "sources": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "clause": {
-                                "anyOf": [
-                                    {"type": "null"},
-                                    {"type": "string"},
-                                ],
-                            },
-                            "pages": {
-                                "type": "array",
-                                "items": {"type": "integer"},
-                            },
-                        },
-                        "required": ["clause", "pages"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            "required": ["value", "sources"],
-            "additionalProperties": False,
-        },
-    },
 }
+
+
+@dataclass(frozen=True)
+class CategoryConfig:
+    name: str
+    response_field: str
+    description: str
+    empty_value: str
+    max_results: int
+    num_predict: int
+
+
+CATEGORY_CONFIGS = (
+    CategoryConfig(
+        name="amount",
+        response_field="contract_amount",
+        description=(
+            "Найди только итоговую цену/сумму контракта. Игнорируй НМЦК, "
+            "обеспечение, гарантии, штрафы, пени и посторонние суммы."
+        ),
+        empty_value="null",
+        max_results=1,
+        num_predict=500,
+    ),
+    CategoryConfig(
+        name="terms",
+        response_field="performance_terms",
+        description=(
+            "Найди основной срок исполнения контракта: срок выполнения работ, поставки товара "
+            "или оказания услуг. В первую очередь выбирай сроки из пунктов о предмете, сроках "
+            "поставки/выполнения или графике выполнения обязательств. Не включай второстепенные "
+            "сроки приемки, оплаты, устранения недостатков, претензий, уведомлений, действия "
+            "контракта, форс-мажора и гарантий, если найден основной срок исполнения."
+        ),
+        empty_value="[]",
+        max_results=3,
+        num_predict=1000,
+    ),
+    CategoryConfig(
+        name="requirements",
+        response_field="contractor_requirements",
+        description=(
+            "Найди ключевые требования и обязанности исполнителя, поставщика или подрядчика."
+        ),
+        empty_value="[]",
+        max_results=5,
+        num_predict=1400,
+    ),
+    CategoryConfig(
+        name="penalties",
+        response_field="penalties",
+        description="Найди штрафы, пени, неустойки и условия ответственности.",
+        empty_value="[]",
+        max_results=5,
+        num_predict=1400,
+    ),
+)
 
 
 class OllamaError(Exception):
@@ -92,24 +103,52 @@ async def summarize_contract_fragments(
     fragments_by_category: dict[str, list[PdfTextFragment]],
     model: str | None = None,
 ) -> ContractSummary:
-    prompt = _build_summary_prompt(fragments_by_category)
-    return await _request_contract_summary(prompt=prompt, model=model)
+    summary = ContractSummary()
+
+    for config in CATEGORY_CONFIGS:
+        fragments = fragments_by_category.get(config.name, [])
+        result = await analyze_category(
+            config=config,
+            fragments=fragments,
+            model=model,
+        )
+
+        _merge_category_result(summary, config, result, fragments)
+
+    return summary
 
 
-async def _request_contract_summary(prompt: str, model: str | None = None) -> ContractSummary:
+async def analyze_category(
+    config: CategoryConfig,
+    fragments: list[PdfTextFragment],
+    model: str | None = None,
+) -> dict[str, Any]:
+    prompt = _build_category_prompt(config, fragments)
+    return await _request_category_summary(
+        prompt=prompt,
+        config=config,
+        model=model,
+    )
+
+
+async def _request_category_summary(
+    prompt: str,
+    config: CategoryConfig,
+    model: str | None = None,
+) -> dict[str, Any]:
     try:
         selected_model = model or get_ollama_model()
         base_url = get_ollama_base_url()
         timeout_seconds = get_ollama_timeout_seconds()
         temperature = get_ollama_temperature()
-        num_predict = get_ollama_num_predict()
+        configured_num_predict = get_ollama_num_predict()
     except SettingsError as exc:
         raise OllamaError(str(exc), 500) from exc
 
     payload = {
         "model": selected_model,
         "stream": False,
-        "format": SUMMARY_JSON_SCHEMA,
+        "format": _build_category_json_schema(config),
         "messages": [
             {
                 "role": "system",
@@ -117,7 +156,8 @@ async def _request_contract_summary(prompt: str, model: str | None = None) -> Co
                     "/no_think\n"
                     "Ты анализируешь российские государственные контракты. "
                     "Отвечай строго валидным JSON без markdown и без рассуждений. "
-                    "Запрещено додумывать: используй только факты из переданных фрагментов."
+                    "Запрещено додумывать: используй только факты из переданных фрагментов. "
+                    "Поле value всегда заполняй на русском языке. Не переводи данные на английский."
                 ),
             },
             {
@@ -126,7 +166,7 @@ async def _request_contract_summary(prompt: str, model: str | None = None) -> Co
             },
         ],
         "options": {
-            "num_predict": num_predict,
+            "num_predict": min(configured_num_predict, config.num_predict),
             "temperature": temperature,
         },
     }
@@ -139,84 +179,236 @@ async def _request_contract_summary(prompt: str, model: str | None = None) -> Co
         raise OllamaError("Could not connect to Ollama. Is Ollama running?", 503) from exc
     except httpx.TimeoutException as exc:
         raise OllamaError(
-            f"Ollama request timed out after {timeout_seconds} seconds. "
+            f"Ollama timed out while analyzing {config.name} after {timeout_seconds} seconds. "
             "Reduce OLLAMA_MAX_FRAGMENT_CHARS, OLLAMA_MAX_FRAGMENTS_PER_CATEGORY, "
             "or use a smaller local model.",
             504,
         ) from exc
     except httpx.HTTPStatusError as exc:
-        raise OllamaError(f"Ollama returned HTTP {exc.response.status_code}") from exc
+        raise OllamaError(
+            f"Ollama returned HTTP {exc.response.status_code} while analyzing {config.name}"
+        ) from exc
     except httpx.HTTPError as exc:
-        raise OllamaError("Ollama request failed") from exc
+        raise OllamaError(f"Ollama request failed while analyzing {config.name}") from exc
 
     try:
         content = response.json()["message"]["content"]
     except (KeyError, TypeError, ValueError) as exc:
-        raise OllamaError("Ollama returned an unexpected response") from exc
+        raise OllamaError(f"Ollama returned an unexpected response for {config.name}") from exc
 
-    return _parse_contract_summary(content)
+    return _parse_category_summary(content, config)
 
 
-def _build_summary_prompt(fragments_by_category: dict[str, list[PdfTextFragment]]) -> str:
+def _build_category_json_schema(config: CategoryConfig) -> dict[str, Any]:
+    if config.max_results == 1:
+        field_schema = {
+            "anyOf": [
+                {"type": "null"},
+                {"$ref": "#/$defs/summary_item"},
+            ],
+        }
+    else:
+        field_schema = {
+            "type": "array",
+            "maxItems": config.max_results,
+            "items": {"$ref": "#/$defs/summary_item"},
+        }
+
+    return {
+        "type": "object",
+        "properties": {
+            config.response_field: field_schema,
+        },
+        "required": [config.response_field],
+        "additionalProperties": False,
+        "$defs": {
+            "summary_item": MODEL_ITEM_JSON_SCHEMA,
+        },
+    }
+
+
+def _build_category_prompt(config: CategoryConfig, fragments: list[PdfTextFragment]) -> str:
     return (
         "/no_think\n"
-        "Извлеки из фрагментов только явно указанные данные:\n"
-        "- contract_amount: только цена/сумма контракта; не НМЦК, не обеспечение и не штраф;\n"
-        "- performance_terms: сроки выполнения, поставки, оказания услуг, этапы, даты начала/окончания;\n"
-        "- contractor_requirements: ключевые требования и обязанности исполнителя/поставщика/подрядчика;\n"
-        "- penalties: штрафы, пени, неустойки и условия ответственности.\n"
-        "Для каждого найденного значения обязательно укажи источники sources: номер пункта clause и страницы pages. "
-        "Бери clause и pages только из заголовка фрагмента. Если clause в заголовке null, верни null.\n"
-        "Если поле не найдено в переданных фрагментах, верни null для суммы или пустой список. "
-        "Не используй типовые формулировки, которых нет во фрагментах.\n"
+        f"Анализируй только категорию: {config.name}.\n"
+        f"Задача: {config.description}\n"
+        f"Верни не больше {config.max_results} результат(ов).\n"
+        "Поле value пиши на русском языке. Не переводи текст договора на другой язык. "
+        "Если формулировка есть во фрагменте, сохраняй ее максимально близко к оригиналу.\n"
+        "Для каждого найденного значения обязательно укажи fragment_ids: список id фрагментов, "
+        "из которых взят факт. Для fragment_ids бери только значение после fragment= "
+        "в заголовке фрагмента, например clause-2.1-p3-3. "
+        "Не возвращай clause и pages: их заполнит программа по fragment_id.\n"
+        f"Если категория не найдена в переданных фрагментах, верни {config.empty_value} "
+        f"для поля {config.response_field}.\n"
         "Верни JSON строго такой структуры:\n"
-        "{\n"
-        '  "contract_amount": {\n'
-        '    "value": "сумма контракта строкой",\n'
-        '    "sources": [{"clause": "номер пункта или null", "pages": [1]}]\n'
-        "  },\n"
-        '  "performance_terms": [\n'
-        '    {"value": "срок выполнения", "sources": [{"clause": "1.4", "pages": [1]}]}\n'
-        "  ],\n"
-        '  "contractor_requirements": [\n'
-        '    {"value": "требование", "sources": [{"clause": "2.1.1", "pages": [1]}]}\n'
-        "  ],\n"
-        '  "penalties": [\n'
-        '    {"value": "штраф или пеня", "sources": [{"clause": "10.2", "pages": [10]}]}\n'
-        "  ]\n"
-        "}\n\n"
-        f"Фрагменты договора:\n{_format_fragments_by_category(fragments_by_category)}"
+        f"{_category_json_example(config)}\n\n"
+        f"Фрагменты договора:\n{_format_fragments(config.name, fragments)}"
     )
 
 
-def _format_fragments_by_category(
-    fragments_by_category: dict[str, list[PdfTextFragment]],
-) -> str:
-    sections = []
-    for category in ("amount", "terms", "requirements", "penalties"):
-        fragments = fragments_by_category.get(category, [])
-        sections.append(f"## {category}")
-        if not fragments:
-            sections.append("Фрагменты не найдены.")
-            continue
+def _category_json_example(config: CategoryConfig) -> str:
+    if config.max_results == 1:
+        return (
+            "{\n"
+            f'  "{config.response_field}": {{\n'
+            '    "value": "сумма контракта как указано во фрагментах",\n'
+            '    "fragment_ids": ["fragment-id-from-header"]\n'
+            "  }\n"
+            "}"
+        )
 
-        for fragment in fragments:
-            pages = ", ".join(str(page) for page in fragment.page_numbers)
-            sections.append(
-                f"[fragment={fragment.fragment_id}; clause={fragment.clause or 'null'}; "
-                f"pages=[{pages}]; score={fragment.score}]\n"
-                f"{fragment.text}"
-            )
+    return (
+        "{\n"
+        f'  "{config.response_field}": [\n'
+        '    {"value": "факт как указано во фрагментах", '
+        '"fragment_ids": ["fragment-id-from-header"]}\n'
+        "  ]\n"
+        "}"
+    )
+
+
+def _format_fragments(category: str, fragments: list[PdfTextFragment]) -> str:
+    if not fragments:
+        return f"## {category}\nФрагменты не найдены."
+
+    sections = [f"## {category}"]
+    for fragment in fragments:
+        pages = ", ".join(str(page) for page in fragment.page_numbers)
+        sections.append(
+            f"[fragment={fragment.fragment_id}; clause={fragment.clause or 'null'}; "
+            f"pages=[{pages}]; score={fragment.score}]\n"
+            f"{fragment.text}"
+        )
 
     return "\n\n---\n\n".join(sections)
 
 
-def _parse_contract_summary(content: str) -> ContractSummary:
+def _parse_category_summary(content: str, config: CategoryConfig) -> dict[str, Any]:
     data = _json_loads_lenient(content)
+    if config.response_field not in data:
+        raise OllamaError(
+            f"Ollama JSON response for {config.name} must contain {config.response_field}"
+        )
+
     try:
-        return ContractSummary.model_validate(data)
+        ContractSummary.model_validate(_summary_data_from_category(config, data))
     except ValidationError as exc:
-        raise OllamaError(f"Ollama returned invalid summary schema: {exc}") from exc
+        raise OllamaError(
+            f"Ollama returned invalid schema for {config.name}: {exc}"
+        ) from exc
+    return data
+
+
+def _summary_data_from_category(config: CategoryConfig, data: dict[str, Any]) -> dict[str, Any]:
+    value = data.get(config.response_field)
+    if config.name == "amount":
+        contract_amount = _model_item_to_summary_item(value, {})
+    else:
+        contract_amount = None
+
+    return {
+        "contract_amount": contract_amount,
+        "performance_terms": (
+            [_model_item_to_summary_item(item, {}) for item in value]
+            if config.name == "terms" and isinstance(value, list)
+            else []
+        ),
+        "contractor_requirements": (
+            [_model_item_to_summary_item(item, {}) for item in value]
+            if config.name == "requirements" and isinstance(value, list)
+            else []
+        ),
+        "penalties": (
+            [_model_item_to_summary_item(item, {}) for item in value]
+            if config.name == "penalties" and isinstance(value, list)
+            else []
+        ),
+    }
+
+
+def _merge_category_result(
+    summary: ContractSummary,
+    config: CategoryConfig,
+    result: dict[str, Any],
+    fragments: list[PdfTextFragment],
+) -> None:
+    value = result.get(config.response_field)
+    fragment_lookup = {fragment.fragment_id: fragment for fragment in fragments}
+
+    if config.name == "amount":
+        summary.contract_amount = _model_item_to_summary_item(
+            value,
+            fragment_lookup,
+            category=config.name,
+            require_known_sources=True,
+        )
+        return
+
+    items = getattr(summary, config.response_field)
+    if not isinstance(value, list):
+        return
+
+    items.extend(
+        item
+        for item in (
+            _model_item_to_summary_item(
+                model_item,
+                fragment_lookup,
+                category=config.name,
+                require_known_sources=True,
+            )
+            for model_item in value[: config.max_results]
+        )
+        if item is not None
+    )
+
+
+def _model_item_to_summary_item(
+    model_item: Any,
+    fragment_lookup: dict[str, PdfTextFragment],
+    category: str | None = None,
+    require_known_sources: bool = False,
+) -> SummaryItem | None:
+    if not isinstance(model_item, dict):
+        return None
+
+    value = str(model_item.get("value", "")).strip()
+    if not value:
+        return None
+
+    fragment_ids = model_item.get("fragment_ids", [])
+    if not isinstance(fragment_ids, list):
+        fragment_ids = [fragment_ids]
+
+    sources = []
+    unknown_fragment_ids = []
+    seen_sources = set()
+    for fragment_id in fragment_ids:
+        fragment = fragment_lookup.get(str(fragment_id))
+        if fragment is None:
+            unknown_fragment_ids.append(str(fragment_id))
+            continue
+
+        key = (fragment.clause, fragment.page_numbers)
+        if key in seen_sources:
+            continue
+        seen_sources.add(key)
+        sources.append(
+            {
+                "clause": fragment.clause,
+                "pages": list(fragment.page_numbers),
+            }
+        )
+
+    if require_known_sources and not sources and fragment_ids:
+        category_detail = f" for {category}" if category else ""
+        raise OllamaError(
+            "Ollama returned unknown fragment_ids"
+            f"{category_detail}: {', '.join(unknown_fragment_ids)}"
+        )
+
+    return SummaryItem.model_validate({"value": value, "sources": sources})
 
 
 def _json_loads_lenient(content: str) -> dict[str, Any]:
